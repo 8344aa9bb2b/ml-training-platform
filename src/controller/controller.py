@@ -2,6 +2,7 @@
 
 import threading
 import time
+import signal
 from typing import Dict, List, Optional
 from collections import defaultdict
 
@@ -34,8 +35,9 @@ class Controller:
         # State
         self.running = False
         self.worker_registry: Dict[str, dict] = defaultdict(dict)
-        self.task_queue = []
-        self.job_status = {}
+        self.task_queue: List[TaskMessage] = []
+        self.job_status: Dict[str, dict] = {}
+        self.health_check_interval = self.controller_config.get("heartbeat_interval", 10.0)
 
         # Component initialization
         self._init_components()
@@ -92,7 +94,14 @@ class Controller:
         )
         listener_thread.start()
 
-        # Start workload scheduler (background thread)
+        # Start worker health monitor
+        health_thread = threading.Thread(
+            target=self._worker_health_monitor,
+            daemon=True
+        )
+        health_thread.start()
+
+        # Start task scheduler (background thread)
         scheduler_thread = threading.Thread(
             target=self._workload_scheduler,
             daemon=True
@@ -130,6 +139,7 @@ class Controller:
             MessageTypes.TASK_STATUS: self._handle_task_status,
             MessageTypes.METRIC: self._handle_metrics,
             MessageTypes.CHECKPOINT: self._handle_checkpoint,
+            MessageTypes.WORKER_REGISTER: self._handle_worker_registration,
         }
 
         handler = handler_map.get(message.message_type)
@@ -163,6 +173,55 @@ class Controller:
         """Handle checkpoint updates from workers."""
         worker_id = message.sender_id
         self.logger.info(f"Checkpoint saved by worker {worker_id}")
+
+    def _handle_worker_registration(self, message: Message):
+        """Handle worker registration messages."""
+        worker_id = message.sender_id
+        worker_info = dict(message.payload or {})
+
+        if worker_id in self.worker_registry:
+            self.logger.info(f"Worker {worker_id} already registered")
+        else:
+            self.worker_registry[worker_id] = worker_info
+            self.logger.info(f"Registered new worker: {worker_id}")
+
+        # Registration counts as proof of life
+        self.worker_registry[worker_id]["last_seen"] = time.time()
+        self.worker_registry[worker_id]["status"] = "active"
+
+    def _check_worker_health(self) -> List[str]:
+        """
+        Run a single health sweep, removing workers that missed heartbeats.
+
+        Returns:
+            List of worker IDs removed as dead.
+        """
+        now = time.time()
+        cutoff = now - self.health_check_interval
+
+        dead_workers = [
+            wid for wid, info in self.worker_registry.items()
+            if info.get("last_seen", 0) < cutoff
+        ]
+
+        for dead in dead_workers:
+            del self.worker_registry[dead]
+            self.logger.warning(f"Removed dead worker: {dead}")
+
+        return dead_workers
+
+    def _worker_health_monitor(self):
+        """Periodically check worker health and remove dead workers."""
+        self.logger.info("Worker health monitor started")
+
+        while self.running:
+            try:
+                self._check_worker_health()
+                time.sleep(1)  # Check every second
+
+            except Exception as e:
+                self.logger.error(f"Error in health monitor: {e}")
+                time.sleep(5)
 
     def _resource_monitor_loop(self):
         """Periodically monitor resource availability."""
@@ -228,9 +287,9 @@ class Controller:
         self.logger.info(f"Registered worker: {worker_id}")
 
     def get_available_workers(self) -> List[str]:
-        """Get list of currently active workers."""
+        """Get list of currently active workers (seen within the health window)."""
         now = time.time()
-        cutoff = now - 30  # Workers seen in last 30 seconds
+        cutoff = now - self.health_check_interval
 
         available = [
             wid for wid, info in self.worker_registry.items()
@@ -242,6 +301,11 @@ class Controller:
         """Stop the controller."""
         self.logger.info("Stopping controller...")
         self.running = False
+        if hasattr(self, "comm_manager") and self.comm_manager:
+            try:
+                self.comm_manager.stop()
+            except Exception:
+                pass
 
     def __del__(self):
         """Cleanup on destruction."""

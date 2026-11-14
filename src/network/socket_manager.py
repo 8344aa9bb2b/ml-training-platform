@@ -65,8 +65,8 @@ class SocketManager:
             # Request-Reply pattern (Controller <-> Worker)
             self._socket = self.context.socket(zmq.REQ)
             self._socket.setsockopt(zmq.LINGER, 0)
-            self._socket.setsockopt(zmq.REQ_RETRIES, 3)
-            self._socket.setsockopt(zmq.REQ_TIMEOUT, 5000)  # 5 second timeout
+            # self._socket.setsockopt(zmq.REQ_RETRIES, 3)  # Not available in pyzmq 27.1.0
+            # self._socket.setsockopt(zmq.REQ_TIMEOUT, 5000)  # Not available in pyzmq 27.1.0
             self._socket.bind(f"tcp://{self.host}:{self.port}")
             self.logger.info(f"REQ/REP socket bound to tcp://{self.host}:{self.port}")
 

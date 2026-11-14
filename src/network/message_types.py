@@ -14,6 +14,7 @@ class MessageTypes(str, Enum):
     METRIC = "metric"
     HEARTBEAT = "heartbeat"
     CHECKPOINT = "checkpoint"
+    WORKER_REGISTER = "worker_register"  # New message type for worker registration
 
 
 @dataclass
@@ -25,12 +26,11 @@ class Message:
     recipient_id: Optional[str] = None
     payload: Optional[Dict[str, Any]] = None
     message_id: Optional[str] = None
-    timestamp: Optional[float] = None
+    timestamp: float = None
 
     def __post_init__(self):
         if self.timestamp is None:
-            import time
-            self.timestamp = time.time()
+            self.timestamp = __import__('time').time()
 
 
 @dataclass
@@ -58,7 +58,7 @@ class TensorMessage(Message):
 class ControlMessage(Message):
     """Control messages for synchronization and coordination."""
 
-    control_type: str = "sync"  # sync_barrier, reset, stop, etc.
+    control_type: str = "sync"
     parameters: Optional[Dict[str, Any]] = None
     expected_barriers: int = 0
     barrier_id: str = ""
@@ -74,6 +74,14 @@ class MetricMessage(Message):
     worker_id: str = ""
 
 
+@dataclass
+class WorkerRegistration(Message):
+    """Message for worker registration."""
+
+    worker_id: str = ""
+    capabilities: Dict[str, Any] = field(default_factory=dict)
+
+
 __all__ = [
     "MessageTypes",
     "Message",
@@ -81,4 +89,5 @@ __all__ = [
     "TensorMessage",
     "ControlMessage",
     "MetricMessage",
+    "WorkerRegistration",
 ]
