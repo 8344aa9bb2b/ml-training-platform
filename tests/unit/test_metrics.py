@@ -57,11 +57,14 @@ class TestPlatformMetrics:
             "memory": {"rss_gb": 4.5},
             "gpu": {0: {"memory_allocated_gb": 3.8}},
         }
-        metrics.record_system_resources(resources)
+        metrics.record_system_resources(resources, node_id="worker-01")
         text = metrics.generate_metrics_text()
         assert "rmltp_cpu_percent 45.2" in text
         assert "rmltp_memory_used_gb 4.5" in text
+        assert 'rmltp_node_cpu_percent{node_id="worker-01"} 45.2' in text
+        assert 'rmltp_node_memory_used_gb{node_id="worker-01"} 4.5' in text
         assert 'rmltp_gpu_memory_allocated_gb{device="0"} 3.8' in text
+        assert 'rmltp_node_gpu_memory_allocated_gb{device="0",node_id="worker-01"} 3.8' in text
 
     def test_http_server_lifecycle(self, metrics):
         # High port to avoid any collisions

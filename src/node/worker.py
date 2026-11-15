@@ -56,9 +56,10 @@ class Worker:
     def _init_components(self):
         """Initialize worker components."""
         # Initialize communication manager
+        port = int(self.nodes_config.get("port", 8001))
         self.comm_manager = SocketManager(
-            host="0.0.0.0",
-            port=8001,  # Separate port for workers
+            host=self.nodes_config.get("host", "0.0.0.0"),
+            port=port,
             logger=self.logger
         )
 

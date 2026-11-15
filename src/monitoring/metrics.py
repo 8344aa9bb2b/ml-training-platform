@@ -90,15 +90,33 @@ class PlatformMetrics:
             "System CPU utilization percentage",
             registry=self.registry,
         )
+        self.node_cpu_percent = Gauge(
+            "rmltp_node_cpu_percent",
+            "Per-node CPU utilization percentage",
+            ["node_id"],
+            registry=self.registry,
+        )
         self.memory_used_gb = Gauge(
             "rmltp_memory_used_gb",
             "System RSS memory used in GB",
+            registry=self.registry,
+        )
+        self.node_memory_used_gb = Gauge(
+            "rmltp_node_memory_used_gb",
+            "Per-node RSS memory used in GB",
+            ["node_id"],
             registry=self.registry,
         )
         self.gpu_memory_allocated_gb = Gauge(
             "rmltp_gpu_memory_allocated_gb",
             "GPU memory allocated in GB",
             ["device"],
+            registry=self.registry,
+        )
+        self.node_gpu_memory_allocated_gb = Gauge(
+            "rmltp_node_gpu_memory_allocated_gb",
+            "Per-node GPU memory allocated in GB",
+            ["node_id", "device"],
             registry=self.registry,
         )
 
@@ -178,26 +196,35 @@ class PlatformMetrics:
         if "throughput" in metrics:
             self.throughput.labels(worker_id=worker_id).set(float(metrics["throughput"]))
 
-    def record_system_resources(self, resources: Dict[str, Any]) -> None:
-        """Record system and hardware utilization metrics."""
+    def record_system_resources(self, resources: Dict[str, Any], node_id: str = "controller") -> None:
+        """Record system and hardware utilization metrics for a given node.
+
+        Args:
+            resources: Dictionary containing CPU, memory, and GPU usage.
+            node_id: Identifier of the node (e.g. 'controller', 'worker-1').
+        """
         if not resources:
             return
 
         cpu = resources.get("cpu", {})
         if "percent" in cpu:
-            self.cpu_percent.set(float(cpu["percent"]))
+            val = float(cpu["percent"])
+            self.cpu_percent.set(val)
+            self.node_cpu_percent.labels(node_id=node_id).set(val)
 
         memory = resources.get("memory", {})
         if "rss_gb" in memory:
-            self.memory_used_gb.set(float(memory["rss_gb"]))
+            val = float(memory["rss_gb"])
+            self.memory_used_gb.set(val)
+            self.node_memory_used_gb.labels(node_id=node_id).set(val)
 
         gpu = resources.get("gpu", {})
         if isinstance(gpu, dict) and gpu != {"none": 0.0}:
             for dev_id, usage in gpu.items():
                 if isinstance(usage, dict) and "memory_allocated_gb" in usage:
-                    self.gpu_memory_allocated_gb.labels(device=str(dev_id)).set(
-                        float(usage["memory_allocated_gb"])
-                    )
+                    mem_val = float(usage["memory_allocated_gb"])
+                    self.gpu_memory_allocated_gb.labels(device=str(dev_id)).set(mem_val)
+                    self.node_gpu_memory_allocated_gb.labels(node_id=node_id, device=str(dev_id)).set(mem_val)
 
     def generate_metrics_text(self) -> str:
         """Generate Prometheus exposition text format string."""
