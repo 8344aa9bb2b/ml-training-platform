@@ -117,3 +117,38 @@ class TestWorker:
         ctrl = ControlMessage(message_type="control", sender_id="controller", control_type="stop")
         simulated_worker._handle_control_message(ctrl)
         assert simulated_worker.running is False
+
+    def test_connect_to_controller_tcp_handshake(self, mock_logger):
+        """Verify real TCP registration handshake between Worker and Controller socket."""
+        import time
+        from src.network.socket_manager import SocketManager
+        from src.network.message_types import MessageTypes
+
+        server_port = 15582
+        server = SocketManager(
+            host="127.0.0.1",
+            port=server_port,
+            logger=mock_logger,
+            pattern="reqrep",
+            is_server=True,
+        )
+
+        worker = Worker(
+            config={"nodes": {"id": "worker-test-tcp", "port": 15583}},
+            logger=mock_logger,
+        )
+
+        try:
+            worker.connect_to_controller(f"tcp://127.0.0.1:{server_port}")
+            time.sleep(0.05)
+
+            received = server.listen(timeout_ms=1000)
+            assert len(received) == 1
+            reg = received[0]
+            assert reg.message_type == MessageTypes.WORKER_REGISTER
+            assert reg.sender_id == "worker-test-tcp"
+            assert "cpu" in reg.payload
+            assert reg.payload["cpu"]["count"] >= 1
+        finally:
+            worker.stop()
+            server.stop()

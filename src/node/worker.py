@@ -14,6 +14,7 @@ from src.network.message_types import (
     TensorMessage,
     ControlMessage,
     MetricMessage,
+    WorkerRegistration,
 )
 from src.network.socket_manager import SocketManager
 from core.logger import get_logger
@@ -58,9 +59,12 @@ class Worker:
         # Initialize communication manager
         port = int(self.nodes_config.get("port", 8001))
         self.comm_manager = SocketManager(
-            host=self.nodes_config.get("host", "0.0.0.0"),
+            host=self.nodes_config.get("host", "127.0.0.1"),
             port=port,
-            logger=self.logger
+            logger=self.logger,
+            pattern="reqrep",
+            is_server=False,
+            identity=self.worker_id,
         )
 
         self.logger.info(f"Worker {self.worker_id} components initialized")
@@ -78,16 +82,42 @@ class Worker:
 
     def connect_to_controller(self, controller_address: str):
         """
-        Connect to the controller.
+        Connect to the controller and complete registration handshake.
 
         Args:
-            controller_address: Controller address in format "host:port"
+            controller_address: Controller address in format "host:port" or "tcp://host:port"
         """
         self.logger.info(f"Connecting to controller at {controller_address}")
-        # TODO: Implement connection logic
-        # 1. Create connection to controller's message socket
-        # 2. Register worker with controller
-        # 3. Start listening for task assignments
+        self.comm_manager.connect(controller_address)
+
+        # Hardware capabilities
+        gpu_info = {
+            "available": torch.cuda.is_available(),
+            "count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            "type": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none",
+        }
+        cpu_info = {
+            "count": os.cpu_count() or 1,
+            "pid": os.getpid(),
+        }
+
+        reg_msg = WorkerRegistration(
+            message_type=MessageTypes.WORKER_REGISTER,
+            sender_id=self.worker_id,
+            worker_id=self.worker_id,
+            capabilities={
+                "cpu": cpu_info,
+                "gpu": gpu_info,
+                "pid": os.getpid(),
+            },
+            payload={
+                "gpu": gpu_info,
+                "cpu": cpu_info,
+                "pid": os.getpid(),
+            },
+        )
+        self.comm_manager.send_message(reg_msg)
+        self.logger.info(f"Worker {self.worker_id} registered with controller at {controller_address}")
 
     def serve_standalone(self):
         """Serve in standalone mode (no controller)."""
@@ -135,23 +165,22 @@ class Worker:
         """Listen for messages from controller."""
         self.logger.info("Worker message listener started")
 
-        def message_handler(message: Message):
-            """Handle incoming messages."""
-            self.logger.debug(f"Worker received: {message.message_type}")
+        while self.running:
+            try:
+                messages = self.comm_manager.listen(timeout_ms=100)
+                for message in messages:
+                    self.logger.debug(f"Worker received: {message.message_type}")
 
-            # Route to appropriate handler
-            if message.message_type == MessageTypes.TASK_ASSIGNMENT:
-                self._handle_task_assignment(message)
-            elif message.message_type == MessageTypes.CONTROL:
-                self._handle_control_message(message)
-            elif message.message_type == MessageTypes.HEARTBEAT:
-                self._handle_heartbeat_response(message)
+                    if message.message_type == MessageTypes.TASK_ASSIGNMENT:
+                        self._handle_task_assignment(message)
+                    elif message.message_type == MessageTypes.CONTROL:
+                        self._handle_control_message(message)
+                    elif message.message_type == MessageTypes.HEARTBEAT:
+                        self._handle_heartbeat_response(message)
 
-        # Start listening
-        self.comm_manager.start_listener(
-            message_handler=message_handler,
-            interval_ms=100
-        )
+            except Exception as e:
+                if self.running:
+                    self.logger.error(f"Error in worker message listener: {e}")
 
     def _handle_task_assignment(self, message: TaskMessage):
         """Handle task assignment from controller."""
@@ -405,6 +434,8 @@ class Worker:
         """Stop the worker node."""
         self.logger.info("Worker stopping...")
         self.running = False
+        if hasattr(self, "comm_manager") and self.comm_manager is not None:
+            self.comm_manager.stop()
 
     def __del__(self):
         """Cleanup on destruction."""
