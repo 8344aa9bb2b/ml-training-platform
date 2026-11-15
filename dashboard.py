@@ -577,8 +577,14 @@ def list_jobs():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="RMLTP Dashboard")
+    parser.add_argument("--host", type=str, default=os.environ.get("HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 5000)))
+    args = parser.parse_args()
+
     print("\n" + "=" * 65)
     print("  🚀 RMLTP Distributed Machine Learning Platform Dashboard")
-    print("  Running at: http://localhost:5000")
+    print(f"  Running at: http://{args.host}:{args.port}")
     print("=" * 65 + "\n")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=args.host, port=args.port, debug=False)

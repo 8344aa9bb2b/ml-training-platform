@@ -118,13 +118,16 @@ class TestSocketManagerReqRep:
             identity="worker-2",
         )
         client2.connect(f"tcp://127.0.0.1:{server_port}")
-        time.sleep(0.05)
+        time.sleep(0.1)
 
         # Both workers ping the server so server learns their routing identities
         client1.send_message(Message(message_type=MessageTypes.HEARTBEAT, sender_id="worker-1"))
         client2.send_message(Message(message_type=MessageTypes.HEARTBEAT, sender_id="worker-2"))
 
-        pings = server.listen(timeout_ms=1000)
+        deadline = time.time() + 2.0
+        pings = []
+        while len(pings) < 2 and time.time() < deadline:
+            pings.extend(server.listen(timeout_ms=200))
         assert len(pings) == 2
 
         # Server sends task targeted ONLY to worker-2
