@@ -137,25 +137,47 @@ This starts isolated containers for `controller`, `worker-1`, `worker-2`, and `d
 
 ---
 
-## ☁️ Free Cloud Hosting Deployment
+## ☁️ Free Cloud Hosting Deployment Options (No Credit Card Required)
 
-### Recommended: Hugging Face Spaces (Docker SDK)
-Hugging Face Spaces provides **16GB RAM, 2 vCPUs completely FREE** without requiring a credit card:
+> [!NOTE]
+> Hugging Face recently made their raw *Docker* Space SDK paid / card-verified to curb crypto miners. However, you can still host 100% for free with **Render**, **Koyeb**, or by selecting the **Gradio/Blank Python SDK** on Hugging Face Spaces using our included `app.py`.
 
+### Option 1: Render (100% Free Docker Web Service)
+Render deploys raw `Dockerfile` containers completely free without a credit card:
+1. Push your repository to GitHub.
+2. Sign up for free at [render.com](https://render.com/) (using GitHub OAuth).
+3. Click **New +** -> **Web Service** -> Connect your GitHub repo.
+4. Render automatically reads our included [render.yaml](render.yaml) and [Dockerfile](Dockerfile).
+5. Choose the **Free Plan** and click **Deploy Web Service**.
+6. Render builds the container and provides you with a free `https://<your-app>.onrender.com` public URL.
+
+### Option 2: Hugging Face Spaces (100% Free 16GB RAM via Python/Gradio SDK)
+If you prefer Hugging Face Spaces' generous 16GB RAM free tier:
 1. Create a free account at [huggingface.co](https://huggingface.co/).
-2. Click **New Space** -> Choose **Docker** as Space SDK -> Select **Blank**.
-3. Clone the repo and push your code:
+2. Click **New Space** -> Choose **Gradio** or **Blank** (NOT Docker) as the SDK -> Free CPU (2 vCPU, 16GB RAM).
+3. Push this repository to your Space:
    ```bash
-   git remote add space https://huggingface.co/spaces/<your-username>/<your-space-name>
+   git remote add space https://huggingface.co/spaces/<username>/<space-name>
    git push space master:main
    ```
-4. Hugging Face Spaces automatically builds the `Dockerfile`, invokes `start_container.sh`, and serves the live Web Dashboard on port `7860`!
+4. Hugging Face automatically executes our included [app.py](app.py), which boots the background Controller and Worker daemons over ZeroMQ TCP and serves the interactive dashboard on port `7860`!
 
-### Alternative: Render Free Web Service
-1. Connect your GitHub repository to [Render](https://render.com/).
-2. Select **Web Service** -> Environment **Docker**.
-3. Set environment variable `PORT=10000`.
-4. Deploy for free.
+### Option 3: Koyeb (100% Free Serverless Containers)
+1. Sign up at [koyeb.com](https://www.koyeb.com/) (No credit card required).
+2. Create a new App -> Choose **GitHub** -> select your repository.
+3. Select **Dockerfile** builder and the **Free Eco Instance** (nano).
+4. Koyeb deploys your Docker container with a global CDN URL.
+
+### Option 4: Instant Public URL via Cloudflare Tunnel (Zero-Cloud Option)
+If you want to run the platform on your own local PC or GPU while generating a free, secure HTTPS public URL for anyone to test:
+```bash
+# Start your local cluster / dashboard:
+python dashboard.py --port 5000
+
+# In another terminal, download cloudflared and run (no account/card needed):
+cloudflared tunnel --url http://localhost:5000
+```
+Cloudflare gives you an instant `https://<random-id>.trycloudflare.com` link that tunnels straight to your local dashboard!
 
 ---
 

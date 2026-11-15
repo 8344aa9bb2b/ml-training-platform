@@ -225,19 +225,19 @@ Containers isolate dependencies, Python environments, and CUDA drivers:
 - **Dockerfile**: Defines the base image (`python:3.12-slim`), installs PyTorch and ZeroMQ, and sets the entrypoint.
 - **Docker Compose**: Orchestrates multi-container topologies locally (Controller service + Worker services + Dashboard).
 
-### 9.2 Free Hosting Platform Analysis
+### 9.2 Free Hosting Platform Analysis (Zero Credit Card Required)
 
 | Platform | Free Tier Specifications | Multi-Process / Multi-Port Support | Recommendation for RMLTP |
 |---|---|---|---|
-| **Hugging Face Spaces (Docker SDK)** | **16 GB RAM, 2 vCPU, 50 GB Disk** (100% Free, No Credit Card) | Single container running internal processes + public Web Port (7860 or 5000) | 🌟 **Top Recommendation**: Most generous RAM for PyTorch; single container supervisor effortlessly runs Controller + Workers + Web Dashboard! |
-| **Render.com** | 512 MB RAM, 0.1 vCPU (Free Web Service) | 1 public web port | Good for web APIs, but 512 MB RAM is too tight for PyTorch training workloads. |
-| **Koyeb / Fly.io** | 256–512 MB RAM | Docker support | Requires credit card verification; very tight memory. |
+| **Render.com (Docker Web Service)** | 512 MB RAM, 0.1 vCPU (100% Free, No Credit Card) | Deploys raw `Dockerfile` directly from GitHub via `render.yaml` | 🌟 **Top Recommendation for Docker**: Real Docker container deployment without credit card or paid tiers. |
+| **Hugging Face Spaces (Python / Gradio SDK)** | **16 GB RAM, 2 vCPU, 50 GB Disk** (100% Free, No Credit Card) | Runs `python app.py` on port 7860 | 🌟 **Top Recommendation for Memory**: Raw Docker on HF is now card-verified/paid, but **Gradio/Python Spaces remain 100% free with 16GB RAM**! Our `app.py` boots Controller + Workers as background daemons and serves the live dashboard on port 7860! |
+| **Koyeb** | 512 MB RAM (Free Eco Tier, No Credit Card) | Docker container from GitHub or Docker Hub | Great secondary Docker option. |
+| **Cloudflare Tunnel (`cloudflared`)** | Local hardware (No limits, 100% Free, No Account/Card) | Tunnels local `http://localhost:5000` to global HTTPS URL | Perfect for live assignment demos with full local CPU/GPU speed and 0 cloud setup. |
 
-**The Strategy for Hugging Face Spaces (Docker):**
-We bundle a process supervisor ([start_container.sh](file:///C:/Users/AMMAR%20SHAIKH/Desktop/Documents/learning-tech/PROJECTS/ml-training-platform/start_container.sh)) inside a Docker container:
-1. Starts the Controller in the background on port `15550`.
-2. Starts Worker 1 and Worker 2 in the background as separate OS processes connecting over `127.0.0.1:15550`.
-3. Starts the Dashboard on port `7860` (Hugging Face standard) to give anyone a publicly accessible live URL!
+**The Strategy for 100% Free Deployment:**
+1. **On Render**: Push to GitHub and deploy via our included `render.yaml` and `Dockerfile`.
+2. **On Hugging Face Spaces**: Select **Gradio/Blank SDK** (Free CPU, 16GB RAM) and push. It automatically executes `app.py`, which boots the Controller and Workers over ZeroMQ TCP and serves the web dashboard on port `7860`.
+3. **On Local Machine**: Run `cloudflared tunnel --url http://localhost:5000` to get an instant public link.
 
 ---
 
