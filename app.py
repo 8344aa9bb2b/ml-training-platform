@@ -17,6 +17,24 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from dashboard import get_harness
 
+# Support Hugging Face ZeroGPU acceleration if enabled in Space settings
+try:
+    import spaces
+except ImportError:
+    class spaces:
+        @staticmethod
+        def GPU(fn=None, duration=60):
+            if fn is None:
+                return lambda f: f
+            return fn
+
+
+@spaces.GPU(duration=60)
+def execute_distributed_training_step():
+    """Execute distributed training step with ZeroGPU acceleration on Hugging Face."""
+    harness = get_harness()
+    return harness.train_step()
+
 
 def create_gradio_app():
     """Build a Gradio Blocks application wired directly into RMLTP cluster harness."""
@@ -46,7 +64,7 @@ def create_gradio_app():
         )
 
     def on_train_step():
-        harness.train_step()
+        execute_distributed_training_step()
         return refresh_stats()
 
     def on_simulate_crash():
