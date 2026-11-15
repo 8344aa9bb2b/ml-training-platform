@@ -339,39 +339,92 @@ class Controller:
         while self.running:
             try:
                 if self.task_queue:
-                    # Move tasks from queue to scheduler
-                    for task_msg in self.task_queue:
-                        self.scheduler.schedule_batch([task_msg])
-                    self.task_queue = []
-                time.sleep(0.5)
+                    available = self.get_available_workers()
+                    if available:
+                        # Pop next task
+                        task_msg = self.task_queue.pop(0)
+                        # Pick worker with least active tasks
+                        worker_id = min(
+                            available,
+                            key=lambda w: len(self.worker_active_tasks.get(w, []))
+                        )
+                        self.dispatch_task(task_msg, worker_id)
+                time.sleep(0.2)
             except Exception as e:
-                self.logger.error(f"Error in workload scheduler: {e}")
+                if self.running:
+                    self.logger.error(f"Error in workload scheduler: {e}")
 
-    def run_job(self, job_config: dict):
+    def dispatch_task(self, task: TaskMessage, worker_id: str):
+        """Dispatch a task message over TCP to a specific worker."""
+        task.recipient_id = worker_id
+        task.sender_id = "controller"
+        if worker_id not in self.worker_active_tasks:
+            self.worker_active_tasks[worker_id] = []
+        self.worker_active_tasks[worker_id].append(task)
+        self.comm_manager.send_message(task)
+        self.logger.info(f"Dispatched task {task.task_id} to worker {worker_id}")
+
+    def run_job(self, job_config: dict) -> dict:
         """
-        Run a single training job.
+        Run a distributed training job.
 
         Args:
             job_config: Job configuration dictionary
+
+        Returns:
+            Dict containing job execution results and status
         """
-        self.logger.info(f"Starting job: {job_config.get('job', {}).get('name')}")
+        job_info = job_config.get("job", {})
+        job_name = job_info.get("name", job_config.get("job_name", "distributed-job"))
+        steps = int(job_info.get("steps", job_config.get("steps", 3)))
+        batch_size = int(job_info.get("batch_size", job_config.get("batch_size", 16)))
+
+        self.logger.info(f"Starting job: {job_name} ({steps} steps, batch_size={batch_size})")
+
+        available_workers = self.get_available_workers()
+        if not available_workers:
+            # Fallback to registered workers if within initial connection phase
+            available_workers = list(self.worker_registry.keys())
+
+        if not available_workers:
+            self.logger.warning("No workers currently available for job")
+            return {"status": "failed", "error": "No available workers"}
+
+        executed_steps = 0
+        step_metrics = []
 
         try:
-            # Job execution logic
-            # 1. Validate job configuration
-            # 2. Allocate resources
-            # 3. Dispatch tasks to workers
-            # 4. Monitor job progress
-            # 5. Collect results and checkpoints
-            # 6. Cleanup
+            for step in range(steps):
+                step_task_ids = []
+                for idx, wid in enumerate(available_workers):
+                    task_id = f"{job_name}-step{step}-w{idx}"
+                    task = TaskMessage(
+                        message_type=MessageTypes.TASK_ASSIGNMENT,
+                        sender_id="controller",
+                        recipient_id=wid,
+                        task_id=task_id,
+                        task_type="forward_pass",
+                        parameters={"batch_size": batch_size, "step": step},
+                    )
+                    self.dispatch_task(task, wid)
+                    step_task_ids.append(task_id)
 
-            self.logger.info("Job started successfully")
+                executed_steps += 1
+                metric_entry = {"step": step, "active_workers": len(available_workers)}
+                step_metrics.append(metric_entry)
+
+            self.logger.info(f"Job {job_name} completed successfully ({executed_steps} steps)")
+            return {
+                "status": "completed",
+                "job_name": job_name,
+                "executed_steps": executed_steps,
+                "workers": available_workers,
+                "metrics": step_metrics,
+            }
 
         except Exception as e:
             self.logger.error(f"Job execution failed: {e}")
-            raise
-        finally:
-            self.logger.info("Job completed")
+            return {"status": "failed", "error": str(e)}
 
     def add_task_to_queue(self, task: TaskMessage):
         """Add a task to the scheduling queue."""

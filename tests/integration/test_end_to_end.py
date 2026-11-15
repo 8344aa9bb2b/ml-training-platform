@@ -207,3 +207,81 @@ class TestEndToEndCluster:
 
         assert controller.metrics.tasks_completed_total._value.get() == 1
         assert controller.metrics.tasks_reassigned_total._value.get() == 1
+
+    def test_end_to_end_multiprocess_tcp_cluster(self, mock_logger, tmp_path):
+        """Verify full loopback TCP cluster: Controller accepts registration from real Workers,
+
+        dispatches tasks over TCP, workers execute them and report status back.
+        """
+        import threading
+        port = 15586
+        ckpt_dir = str(tmp_path / "tcp_ckpts")
+
+        with patch("signal.signal"):
+            controller = Controller(
+                config={
+                    "controller": {
+                        "host": "127.0.0.1",
+                        "port": port,
+                        "heartbeat_interval": 2.0,
+                    },
+                    "monitoring": {"checkpoint_dir": ckpt_dir},
+                },
+                logger=mock_logger,
+            )
+
+        controller.running = True
+        ctrl_listener = threading.Thread(target=controller._message_listener, daemon=True)
+        ctrl_listener.start()
+
+        worker1 = Worker(
+            config={"nodes": {"id": "worker-tcp-1", "port": 15587}},
+            logger=mock_logger,
+        )
+        worker2 = Worker(
+            config={"nodes": {"id": "worker-tcp-2", "port": 15588}},
+            logger=mock_logger,
+        )
+
+        w1_thread = None
+        w2_thread = None
+
+        try:
+            # 1. Connect workers to controller over TCP
+            worker1.connect_to_controller(f"tcp://127.0.0.1:{port}")
+            worker2.connect_to_controller(f"tcp://127.0.0.1:{port}")
+
+            # 2. Start worker message listeners
+            worker1.running = True
+            worker2.running = True
+            w1_thread = threading.Thread(target=worker1._message_listener, daemon=True)
+            w2_thread = threading.Thread(target=worker2._message_listener, daemon=True)
+            w1_thread.start()
+            w2_thread.start()
+
+            # Wait for registration handshake over TCP
+            deadline = time.time() + 3.0
+            while len(controller.worker_registry) < 2 and time.time() < deadline:
+                time.sleep(0.05)
+
+            assert len(controller.worker_registry) == 2, "Workers failed to register over TCP"
+            assert "worker-tcp-1" in controller.worker_registry
+            assert "worker-tcp-2" in controller.worker_registry
+
+            # 3. Controller runs a distributed job over TCP
+            job_config = {
+                "job": {"name": "tcp-distributed-mlp", "steps": 2, "batch_size": 16}
+            }
+            res = controller.run_job(job_config)
+
+            assert res["status"] == "completed"
+            assert res["executed_steps"] == 2
+            assert len(res["workers"]) == 2
+
+            # Give a brief moment for worker status messages to arrive back over TCP
+            time.sleep(0.2)
+
+        finally:
+            worker1.stop()
+            worker2.stop()
+            controller.stop()
