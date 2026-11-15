@@ -1,20 +1,48 @@
 """Socket manager for inter-component communication.
 
 Supports dual-pattern communication:
-- REQ/REP: Request-Reply pattern for task assignment and status updates
+- REQ/REP: Non-blocking ROUTER (server) / DEALER (client) pattern for async task dispatch and status updates
 - PUB/SUB: Publish-Subscribe pattern for status/metrics broadcasting
 """
 
-import zmq
 import time
 import json
-from typing import List, Dict, Any, Optional
-from dataclasses import asdict
-from threading import Thread, Lock, Event
 import queue
+import dataclasses
+from threading import Thread, Lock, Event
+from typing import List, Dict, Any, Optional
+
+import zmq
 
 from core.logger import get_logger
-from src.network.message_types import Message
+from src.network.message_types import (
+    Message,
+    MessageTypes,
+    TaskMessage,
+    TensorMessage,
+    ControlMessage,
+    MetricMessage,
+    WorkerRegistration,
+)
+
+
+def deserialize_message(data: Dict[str, Any]) -> Message:
+    """Deserialize raw dictionary into strongly-typed Message subclass."""
+    msg_type = data.get("message_type")
+
+    cls_map = {
+        MessageTypes.TASK_ASSIGNMENT: TaskMessage,
+        MessageTypes.TASK_STATUS: TaskMessage,
+        MessageTypes.TENSOR_DATA: TensorMessage,
+        MessageTypes.CONTROL: ControlMessage,
+        MessageTypes.METRIC: MetricMessage,
+        MessageTypes.WORKER_REGISTER: WorkerRegistration,
+    }
+
+    target_cls = cls_map.get(msg_type, Message)
+    valid_fields = {f.name for f in dataclasses.fields(target_cls)}
+    filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+    return target_cls(**filtered_data)
 
 
 class SocketManager:
@@ -26,7 +54,9 @@ class SocketManager:
         port: int = 8000,
         logger=None,
         context: Optional[zmq.Context] = None,
-        pattern: str = "reqrep"
+        pattern: str = "reqrep",
+        is_server: bool = True,
+        identity: Optional[str] = None,
     ):
         """
         Initialize socket manager with specified communication pattern.
@@ -36,66 +66,91 @@ class SocketManager:
             port: Port number
             logger: Logger instance
             context: Optional pre-existing ZeroMQ context
-            pattern: Communication pattern - 'reqrep' (Request-Reply) or 'pubsub' (Publish-Subscribe)
+            pattern: Communication pattern - 'reqrep' (ROUTER/DEALER) or 'pubsub' (PUB/SUB)
+            is_server: True to bind as server/publisher, False to act as client/subscriber
+            identity: Optional unique string identity for the socket
         """
         self.host = host
         self.port = port
         self.logger = logger or get_logger(name="socket_manager")
         self.pattern = pattern
+        self.is_server = is_server
+        self.identity = identity
+        self.connected_address: Optional[str] = None
 
-        # Use provided context or create new one
+        # Manage ZeroMQ context ownership
+        self._owns_context = context is None
         self.context = context or zmq.Context()
 
-        # Socket setup
+        # Socket and identity tracking
         self._socket = None
-        self._bind()
+        self._client_identities: Dict[str, bytes] = {}
 
         # Thread synchronization
         self._lock = Lock()
         self._running = False
         self._stop_event = Event()
+        self._receive_thread: Optional[Thread] = None
 
         # Queues for async communication
         self._send_queue = queue.Queue()
         self._receive_queue = queue.Queue()
 
+        # Initialize socket setup
+        self._bind()
+
     def _bind(self):
-        """Bind socket to address based on pattern."""
+        """Setup and configure the ZeroMQ socket."""
         if self.pattern == "reqrep":
-            # Request-Reply pattern (Controller <-> Worker)
-            self._socket = self.context.socket(zmq.REQ)
-            self._socket.setsockopt(zmq.LINGER, 0)
-            # self._socket.setsockopt(zmq.REQ_RETRIES, 3)  # Not available in pyzmq 27.1.0
-            # self._socket.setsockopt(zmq.REQ_TIMEOUT, 5000)  # Not available in pyzmq 27.1.0
-            self._socket.bind(f"tcp://{self.host}:{self.port}")
-            self.logger.info(f"REQ/REP socket bound to tcp://{self.host}:{self.port}")
+            if self.is_server:
+                # ROUTER socket on server: accepts concurrent asynchronous worker connections
+                self._socket = self.context.socket(zmq.ROUTER)
+                self._socket.setsockopt(zmq.LINGER, 0)
+                if self.identity:
+                    self._socket.setsockopt_string(zmq.IDENTITY, self.identity)
+                self._socket.bind(f"tcp://{self.host}:{self.port}")
+                self.logger.info(f"REQ/REP ROUTER socket bound to tcp://{self.host}:{self.port}")
+            else:
+                # DEALER socket on client: non-blocking asynchronous connection to ROUTER
+                self._socket = self.context.socket(zmq.DEALER)
+                self._socket.setsockopt(zmq.LINGER, 0)
+                if self.identity:
+                    self._socket.setsockopt_string(zmq.IDENTITY, self.identity)
+                self.logger.info(f"REQ/REP DEALER socket initialized (identity: {self.identity})")
 
         elif self.pattern == "pubsub":
-            # Publish-Subscribe pattern (Controller -> Workers)
-            self._socket = self.context.socket(zmq.PUB)
-            self._socket.bind(f"tcp://{self.host}:{self.port}")
-            self.logger.info(f"PUB/SUB socket bound to tcp://{self.host}:{self.port}")
+            if self.is_server:
+                # PUB socket on server
+                self._socket = self.context.socket(zmq.PUB)
+                self._socket.setsockopt(zmq.LINGER, 0)
+                self._socket.bind(f"tcp://{self.host}:{self.port}")
+                self.logger.info(f"PUB/SUB socket bound to tcp://{self.host}:{self.port}")
+            else:
+                # SUB socket on client
+                self._socket = self.context.socket(zmq.SUB)
+                self._socket.setsockopt(zmq.LINGER, 0)
+                self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
+                self.logger.info("PUB/SUB subscriber socket initialized")
 
         else:
             raise ValueError(f"Unsupported pattern: {self.pattern}. Use 'reqrep' or 'pubsub'")
 
     def connect(self, address: str):
         """
-        Connect to a remote socket (REQ/REP pattern only).
+        Connect to a remote socket (client mode).
 
         Args:
-            address: Remote address in format "tcp://host:port"
+            address: Remote address in format 'tcp://host:port' or 'host:port'
         """
-        if self.pattern != "reqrep":
-            self.logger.warning("Connect only works with REQ/REP pattern")
-            return
-
-        # Normalize address
         if not address.startswith("tcp://"):
             address = f"tcp://{address}"
 
-        self.logger.info(f"Connecting to {address}")
-        # TODO: Implement actual connection logic
+        with self._lock:
+            if self._socket is None:
+                raise RuntimeError("Socket is not initialized")
+            self.logger.info(f"Connecting to {address}")
+            self._socket.connect(address)
+            self.connected_address = address
 
     def send_message(self, message: Message, timeout_ms: Optional[int] = None):
         """
@@ -103,24 +158,49 @@ class SocketManager:
 
         Args:
             message: Message to send
-            timeout_ms: Optional timeout for send operation (REQ/REP only)
+            timeout_ms: Optional send timeout in milliseconds
         """
         try:
-            message_dict = asdict(message)
-
-            # Serialize to JSON
+            message_dict = dataclasses.asdict(message)
             message_json = json.dumps(message_dict)
+            payload_bytes = message_json.encode("utf-8")
             self.logger.debug(f"Sending message: {message.message_type} to {message.recipient_id}")
 
-            # Send via socket
             with self._lock:
+                if self._socket is None:
+                    self.logger.warning("Attempted to send on closed socket")
+                    return
+
+                if timeout_ms is not None:
+                    self._socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+
                 if self.pattern == "reqrep":
-                    # REQ/REP pattern - send with timeout
-                    if timeout_ms is not None:
-                        self._socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
-                    self._socket.send_string(message_json)
-                else:
-                    # PUB/SUB pattern - fire and forget
+                    if self.is_server:
+                        # Server routing to worker(s)
+                        recipients = []
+                        if message.recipient_id in ("all", "*"):
+                            recipients = list(self._client_identities.values())
+                        elif message.recipient_id:
+                            rid = self._client_identities.get(
+                                message.recipient_id,
+                                message.recipient_id.encode("utf-8"),
+                            )
+                            recipients = [rid]
+                        elif len(self._client_identities) == 1:
+                            recipients = list(self._client_identities.values())
+                        else:
+                            self.logger.warning(
+                                f"Cannot route message without recipient_id on ROUTER socket: {message.message_type}"
+                            )
+                            return
+
+                        for rid in recipients:
+                            self._socket.send_multipart([rid, b"", payload_bytes])
+                    else:
+                        # Client DEALER sends framed message [empty, body]
+                        self._socket.send_multipart([b"", payload_bytes])
+
+                elif self.pattern == "pubsub":
                     self._socket.send_string(message_json)
 
         except zmq.Again:
@@ -130,7 +210,7 @@ class SocketManager:
 
     def send_message_async(self, message: Message):
         """
-        Send a message asynchronously (fire and forget).
+        Send a message asynchronously via background thread.
 
         Args:
             message: Message to send
@@ -139,12 +219,12 @@ class SocketManager:
         if not self._running:
             self._start_background_thread()
 
-    def listen(self, timeout_ms: Optional[int] = None) -> List[Message]:
+    def listen(self, timeout_ms: Optional[int] = 100) -> List[Message]:
         """
         Listen for incoming messages.
 
         Args:
-            timeout_ms: Timeout in milliseconds (0 for non-blocking)
+            timeout_ms: Timeout in milliseconds (None or integer, defaults to 100ms)
 
         Returns:
             List of received messages
@@ -152,32 +232,54 @@ class SocketManager:
         messages = []
 
         with self._lock:
+            if self._socket is None:
+                return []
+
             poller = zmq.Poller()
             poller.register(self._socket, zmq.POLLIN)
 
             try:
-                # Poll with timeout
-                if timeout_ms is not None:
-                    sockets = dict(poller.poll(timeout_ms))
-                else:
-                    sockets = dict(poller.poll())
+                poll_timeout = 0 if timeout_ms is None else max(0, timeout_ms)
+                sockets = dict(poller.poll(poll_timeout))
 
                 if sockets.get(self._socket) == zmq.POLLIN:
-                    # Receive message
-                    try:
-                        message_json = self._socket.recv_string(flags=zmq.NOBLOCK)
-                        message_data = json.loads(message_json)
+                    # Drain all pending messages
+                    while True:
+                        try:
+                            if self.pattern == "reqrep":
+                                frames = self._socket.recv_multipart(flags=zmq.NOBLOCK)
+                                if not frames:
+                                    break
 
-                        # Reconstruct message object
-                        message = Message(**message_data)
-                        messages.append(message)
-                        self.logger.debug(f"Received message: {message.message_type} from {message.sender_id}")
+                                body_str = frames[-1].decode("utf-8")
+                                message_data = json.loads(body_str)
+                                message = deserialize_message(message_data)
 
-                    except zmq.Again:
-                        # No message available
-                        pass
-                    except json.JSONDecodeError as e:
-                        self.logger.warning(f"Failed to parse JSON message: {e}")
+                                if self.is_server and len(frames) >= 2:
+                                    # frames[0] is client routing identity
+                                    sender_routing_id = frames[0]
+                                    self._client_identities[message.sender_id] = sender_routing_id
+
+                                messages.append(message)
+                                self.logger.debug(
+                                    f"Received message: {message.message_type} from {message.sender_id}"
+                                )
+
+                            elif self.pattern == "pubsub":
+                                message_json = self._socket.recv_string(flags=zmq.NOBLOCK)
+                                message_data = json.loads(message_json)
+                                message = deserialize_message(message_data)
+                                messages.append(message)
+                                self.logger.debug(
+                                    f"Received pubsub message: {message.message_type} from {message.sender_id}"
+                                )
+
+                        except zmq.Again:
+                            # Queue drained
+                            break
+                        except json.JSONDecodeError as e:
+                            self.logger.warning(f"Failed to parse JSON message: {e}")
+                            break
 
             except Exception as e:
                 self.logger.error(f"Error during socket receive: {e}")
@@ -185,11 +287,7 @@ class SocketManager:
         return messages
 
     def listen_async(self):
-        """
-        Listen for messages asynchronously in background thread.
-
-        Returns received messages via the receive queue.
-        """
+        """Listen for messages asynchronously in background thread."""
         if not self._running:
             self._start_background_thread()
 
@@ -198,7 +296,7 @@ class SocketManager:
         self._running = True
         self._receive_thread = Thread(
             target=self._background_listener,
-            daemon=True
+            daemon=True,
         )
         self._receive_thread.start()
         self.logger.info("Background listener started")
@@ -207,14 +305,11 @@ class SocketManager:
         """Background listener loop for message handling."""
         while not self._stop_event.is_set():
             try:
-                # Listen for messages
-                messages = self.listen(timeout_ms=100)
+                messages = self.listen(timeout_ms=50)
 
-                # Queue received messages
                 for msg in messages:
                     self._receive_queue.put(msg)
 
-                # Process queued sends
                 while not self._send_queue.empty():
                     try:
                         msg = self._send_queue.get_nowait()
@@ -224,7 +319,7 @@ class SocketManager:
 
             except Exception as e:
                 self.logger.error(f"Error in background listener: {e}")
-                time.sleep(0.1)
+                time.sleep(0.05)
 
     def get_next_message(self, timeout_ms: int = 1000) -> Optional[Message]:
         """
@@ -243,7 +338,7 @@ class SocketManager:
             return None
 
     def stop(self):
-        """Stop the socket manager."""
+        """Stop the socket manager and cleanly release resources."""
         self.logger.info("Socket manager stopping...")
         self._stop_event.set()
         self._running = False
@@ -251,10 +346,19 @@ class SocketManager:
         # Clean up socket
         with self._lock:
             if self._socket:
-                self._socket.close()
+                try:
+                    self._socket.close(linger=0)
+                except Exception:
+                    pass
                 self._socket = None
 
-        self.context.term()
+        if self._owns_context and self.context:
+            try:
+                self.context.term()
+            except Exception:
+                pass
+            self.context = None
+
         self.logger.info("Socket manager stopped")
 
     def __del__(self):
@@ -265,4 +369,4 @@ class SocketManager:
             pass
 
 
-__all__ = ["SocketManager"]
+__all__ = ["SocketManager", "deserialize_message"]
