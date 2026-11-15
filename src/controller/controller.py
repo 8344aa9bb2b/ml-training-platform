@@ -9,6 +9,8 @@ from collections import defaultdict
 from src.network.message_types import Message, MessageTypes, TaskMessage
 from src.network.socket_manager import SocketManager
 from src.scheduler.task_scheduler import TaskScheduler, Task
+from src.monitoring.metrics import PlatformMetrics
+from src.monitoring.checkpoint_manager import CheckpointManager
 from core.config_loader import load_yaml_config
 from core.logger import get_logger
 from core.resource_monitor import ResourceMonitor
@@ -40,6 +42,16 @@ class Controller:
         self.job_status: Dict[str, dict] = {}
         self.health_check_interval = self.controller_config.get("heartbeat_interval", 10.0)
 
+        # Observability & Metrics
+        self.metrics = PlatformMetrics()
+        ckpt_dir = self.monitoring_config.get("checkpoint_dir", "./logs/checkpoints")
+        self.checkpoint_manager = CheckpointManager(checkpoint_dir=ckpt_dir)
+
+        # Resilience & Fault Tolerance
+        self.max_task_retries = int(self.controller_config.get("max_task_retries", 3))
+        self.task_retry_counts: Dict[str, int] = defaultdict(int)
+        self.worker_active_tasks: Dict[str, List[Task]] = defaultdict(list)
+
         # Initialize task scheduler
         self.scheduler = TaskScheduler(
             max_concurrent_tasks=self.controller_config.get("max_workers", 100),
@@ -66,6 +78,11 @@ class Controller:
             port=self.controller_config.get("port", 8000),
             logger=self.logger
         )
+
+        # Start Prometheus server if enabled
+        if self.monitoring_config.get("prometheus_enabled", False):
+            prom_port = int(self.controller_config.get("prometheus_port", 9090))
+            self.metrics.start_server(port=prom_port)
 
         self.logger.info("Controller components initialized")
 
@@ -168,20 +185,51 @@ class Controller:
             "last_seen": time.time(),
             "status": "active"
         })
+        self.metrics.set_active_workers(len(self.worker_registry))
 
     def _handle_task_status(self, message: TaskMessage):
         """Handle task status updates from workers."""
         worker_id = message.sender_id
-        self.logger.info(f"Task {message.task_id} completed: {message.payload}")
+        payload = message.payload or {}
+        task_id = payload.get("task_id", getattr(message, "task_id", "unknown"))
+        successful = payload.get("successful", False)
+
+        if successful:
+            self.metrics.record_task_completed(str(task_id))
+            self.logger.info(f"Task {task_id} completed: {payload}")
+        else:
+            self.metrics.record_task_failed(str(task_id))
+            self.logger.warning(f"Task {task_id} failed: {payload.get('error')}")
+
+        # Remove from active tasks tracking
+        if worker_id in self.worker_active_tasks:
+            self.worker_active_tasks[worker_id] = [
+                t for t in self.worker_active_tasks[worker_id]
+                if getattr(t, "task_id", None) != task_id
+            ]
 
     def _handle_metrics(self, message: Message):
         """Handle training metrics from workers."""
-        self.logger.debug(f"Received metrics from {message.sender_id}")
+        worker_id = message.sender_id
+        metrics_data = message.payload or getattr(message, "metrics", {})
+        self.metrics.record_training_metrics(worker_id, metrics_data)
+        self.logger.debug(f"Received metrics from {worker_id}")
 
     def _handle_checkpoint(self, message: Message):
         """Handle checkpoint updates from workers."""
         worker_id = message.sender_id
-        self.logger.info(f"Checkpoint saved by worker {worker_id}")
+        payload = message.payload or {}
+        step = payload.get("step", 0)
+        state_dict = payload.get("model_state", {})
+        ckpt_metrics = payload.get("metrics", {})
+        if state_dict:
+            self.checkpoint_manager.save_checkpoint(
+                step=step,
+                state_dict=state_dict,
+                metrics=ckpt_metrics,
+                worker_id=worker_id,
+            )
+        self.logger.info(f"Checkpoint saved by worker {worker_id} at step {step}")
 
     def _handle_worker_registration(self, message: Message):
         """Handle worker registration messages."""
@@ -198,10 +246,12 @@ class Controller:
         # Registration counts as proof of life
         self.worker_registry[worker_id]["last_seen"] = time.time()
         self.worker_registry[worker_id]["status"] = "active"
+        self.metrics.set_active_workers(len(self.worker_registry))
 
     def _check_worker_health(self) -> List[str]:
         """
-        Run a single health sweep, removing workers that missed heartbeats.
+        Run a single health sweep, removing workers that missed heartbeats and
+        reassigning orphaned tasks.
 
         Returns:
             List of worker IDs removed as dead.
@@ -215,10 +265,44 @@ class Controller:
         ]
 
         for dead in dead_workers:
+            self.metrics.record_dead_worker(dead)
+            self.logger.warning(f"Dead worker detected: {dead}")
+
+            # Retrieve active tasks assigned to this worker
+            orphaned_tasks = []
+            if dead in self.scheduler.active_tasks:
+                orphaned_tasks.append(self.scheduler.active_tasks[dead])
+            if dead in self.worker_active_tasks:
+                for t in self.worker_active_tasks[dead]:
+                    if t not in orphaned_tasks:
+                        orphaned_tasks.append(t)
+
+            # Reassign or mark permanently failed
+            for task in orphaned_tasks:
+                tid = getattr(task, "task_id", str(task))
+                self.task_retry_counts[tid] += 1
+                attempts = self.task_retry_counts[tid]
+
+                if attempts <= self.max_task_retries:
+                    self.logger.warning(
+                        f"Reassigning task {tid} from dead worker {dead} "
+                        f"(attempt {attempts}/{self.max_task_retries})"
+                    )
+                    self.task_queue.append(task)
+                    self.metrics.record_task_reassigned(tid)
+                else:
+                    self.logger.error(
+                        f"Task {tid} exceeded max retries ({self.max_task_retries}) "
+                        f"after death of worker {dead}; marking permanently failed"
+                    )
+                    self.metrics.record_task_failed(tid)
+
+            # Cleanup worker state
             del self.worker_registry[dead]
             self.scheduler.unregister_worker(dead)
-            self.logger.warning(f"Removed dead worker: {dead}")
+            self.worker_active_tasks.pop(dead, None)
 
+        self.metrics.set_active_workers(len(self.worker_registry))
         return dead_workers
 
     def _worker_health_monitor(self):
@@ -241,8 +325,9 @@ class Controller:
         while self.running:
             try:
                 self.logger.debug("Running resource check")
-                # Update resource monitoring
-                # In production, this would touch actual hardware APIs
+                resources = self.resource_monitor.get_resources()
+                if resources:
+                    self.metrics.record_system_resources(resources)
                 time.sleep(interval)
             except Exception as e:
                 self.logger.error(f"Error in resource monitor: {e}")
@@ -313,6 +398,11 @@ class Controller:
         """Stop the controller."""
         self.logger.info("Stopping controller...")
         self.running = False
+        if hasattr(self, "metrics") and self.metrics:
+            try:
+                self.metrics.stop_server()
+            except Exception:
+                pass
         if hasattr(self, "comm_manager") and self.comm_manager:
             try:
                 self.comm_manager.stop()
