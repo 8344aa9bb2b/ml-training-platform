@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 # Ensure project root is on sys.path
@@ -95,6 +96,16 @@ class ClusterDemoHarness:
         self.step = 0
         self.latest_loss = 0.85
         self.latest_throughput = 0.0
+        self.jobs = [
+            {
+                "id": "job-init-01",
+                "name": "cifar10-resnet50",
+                "dataset": "s3://ml-datasets/cifar10",
+                "workers": 2,
+                "status": "running",
+                "step": 0,
+            }
+        ]
         self.logs = ["Cluster initialized with 2 worker nodes (worker-alpha, worker-beta)."]
 
     def _register_workers(self):
@@ -125,6 +136,10 @@ class ClusterDemoHarness:
         self.step = metrics["step"]
         self.latest_loss = round(metrics["loss"], 4)
         self.latest_throughput = round(64.0 / max(0.0001, elapsed), 1)
+
+        if self.jobs:
+            self.jobs[0]["step"] = self.step
+            self.jobs[0]["status"] = "running"
 
         # Report to Controller metrics
         self.controller.metrics.record_training_metrics(
@@ -171,6 +186,22 @@ class ClusterDemoHarness:
         self.logs.insert(0, msg)
         return {"status": "failed", "message": msg}
 
+    def submit_job(self, job_data: dict) -> dict:
+        """Handle new user job submission."""
+        job_id = f"job-{uuid.uuid4().hex[:6]}"
+        job = {
+            "id": job_id,
+            "name": job_data.get("job_name", "custom-job"),
+            "dataset": job_data.get("dataset_location", "data/default.csv"),
+            "workers": int(job_data.get("num_workers", 2)),
+            "status": "pending",
+            "step": 0,
+        }
+        self.jobs.insert(0, job)
+        msg = f"[Job Submitted] {job['name']} ({job['id']}) queued with {job['workers']} workers."
+        self.logs.insert(0, msg)
+        return job
+
     def get_cluster_status(self):
         # Refresh hardware usage
         res = self.controller.resource_monitor.get_resources()
@@ -199,15 +230,24 @@ class ClusterDemoHarness:
             "loss": self.latest_loss,
             "throughput": self.latest_throughput,
             "workers": workers,
+            "jobs": self.jobs,
             "logs": self.logs,
             "controller_cpu": round(cpu, 1),
             "controller_mem_gb": round(mem, 2),
         }
 
 
-# Initialize App & Harness
+# Initialize App & Lazy Harness
 app = Flask(__name__)
-harness = ClusterDemoHarness()
+_harness: Optional[ClusterDemoHarness] = None
+
+
+def get_harness() -> ClusterDemoHarness:
+    """Lazy initialize demo harness so importing dashboard doesn't immediately bind ports."""
+    global _harness
+    if _harness is None:
+        _harness = ClusterDemoHarness()
+    return _harness
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -223,8 +263,10 @@ HTML_TEMPLATE = """
         .metric-label { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: #94a3b8; }
         .badge-active { background-color: #10b981; }
         .badge-dead { background-color: #ef4444; }
-        .log-box { background-color: #020617; border: 1px solid #1e293b; font-family: monospace; font-size: 0.85rem; height: 180px; overflow-y: auto; padding: 10px; border-radius: 8px; }
-        .btn-custom { font-weight: 600; border-radius: 8px; padding: 10px 20px; }
+        .log-box { background-color: #020617; border: 1px solid #1e293b; font-family: monospace; font-size: 0.85rem; height: 160px; overflow-y: auto; padding: 10px; border-radius: 8px; }
+        .btn-custom { font-weight: 600; border-radius: 8px; padding: 8px 18px; }
+        .form-control, .form-select { background-color: #0f172a; border: 1px solid #334155; color: #f8fafc; }
+        .form-control:focus, .form-select:focus { background-color: #0f172a; border-color: #38bdf8; color: #f8fafc; box-shadow: none; }
     </style>
 </head>
 <body class="p-4">
@@ -236,6 +278,7 @@ HTML_TEMPLATE = """
                 <p class="text-secondary mb-0">Kubernetes-style Orchestration + Ray Scheduling + PyTorch Distributed Core</p>
             </div>
             <div>
+                <button class="btn btn-outline-info btn-custom me-2" data-bs-toggle="modal" data-bs-target="#jobModal">➕ Submit Training Job</button>
                 <button class="btn btn-primary btn-custom me-2" onclick="trainStep()">⚡ Run Distributed Step</button>
                 <button class="btn btn-outline-danger btn-custom" onclick="simulateCrash()">💥 Toggle Worker Crash</button>
             </div>
@@ -303,9 +346,9 @@ HTML_TEMPLATE = """
             <div class="col-md-4">
                 <div class="card p-4 h-100">
                     <h5 class="fw-bold mb-3">⚙️ Controller Master</h5>
-                    <p class="mb-1 text-secondary">ZeroMQ REQ/REP Port: <strong class="text-light">15590</strong></p>
+                    <p class="mb-1 text-secondary">ZeroMQ Port: <strong class="text-light">15590</strong></p>
                     <p class="mb-1 text-secondary">Prometheus Port: <strong class="text-light">9090</strong></p>
-                    <p class="mb-3 text-secondary">Placement Policy: <strong class="text-light">Least Loaded / Round Robin</strong></p>
+                    <p class="mb-3 text-secondary">Placement: <strong class="text-light">Least Loaded / Capability Aware</strong></p>
 
                     <div class="mb-2">
                         <div class="d-flex justify-content-between small text-secondary">
@@ -329,6 +372,28 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Submitted Jobs Queue -->
+        <div class="card p-4 mb-4">
+            <h5 class="fw-bold mb-3">📋 Distributed Training Jobs</h5>
+            <div class="table-responsive">
+                <table class="table table-dark table-hover align-middle mb-0">
+                    <thead>
+                        <tr class="text-secondary">
+                            <th>Job ID</th>
+                            <th>Job Name</th>
+                            <th>Dataset Location</th>
+                            <th>Workers</th>
+                            <th>Status</th>
+                            <th>Step</th>
+                        </tr>
+                    </thead>
+                    <tbody id="jobs-tbody">
+                        <!-- Populated dynamically -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
         <!-- Activity Logs -->
         <div class="card p-4">
             <h5 class="fw-bold mb-2">📜 Real-Time Distributed Event Stream</h5>
@@ -336,6 +401,51 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <!-- Job Submission Modal -->
+    <div class="modal fade" id="jobModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content card border-secondary text-light">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title fw-bold">Submit Distributed Training Job</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary">Job Name</label>
+                        <input type="text" id="input-job-name" class="form-control" value="bert-finetuning">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary">Dataset Location</label>
+                        <input type="text" id="input-dataset" class="form-control" value="s3://datasets/nlp/imdb.parquet">
+                    </div>
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="form-label small text-secondary">Number of Workers</label>
+                            <input type="number" id="input-workers" class="form-control" value="2" min="1" max="8">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label small text-secondary">GPU per Worker</label>
+                            <input type="number" id="input-gpu" class="form-control" value="1" min="0">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary">Parallelism Mode</label>
+                        <select id="input-parallel" class="form-select">
+                            <option value="data_parallel_allreduce">Data Parallel (AllReduce Synchronous)</option>
+                            <option value="data_parallel_ps">Data Parallel (Parameter Server)</option>
+                            <option value="pipeline_parallel">Pipeline Parallel Stages</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" onclick="submitJobModal()">Submit Job</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         async function fetchStatus() {
             try {
@@ -372,6 +482,19 @@ HTML_TEMPLATE = """
                 }
                 document.getElementById('workers-tbody').innerHTML = tbody;
 
+                let jobsTbody = '';
+                for (const j of data.jobs) {
+                    jobsTbody += `<tr>
+                        <td><code>${j.id}</code></td>
+                        <td><strong>${j.name}</strong></td>
+                        <td><small class="text-secondary">${j.dataset}</small></td>
+                        <td>${j.workers}</td>
+                        <td><span class="badge bg-primary">${j.status}</span></td>
+                        <td>${j.step}</td>
+                    </tr>`;
+                }
+                document.getElementById('jobs-tbody').innerHTML = jobsTbody;
+
                 let logHtml = '';
                 for (const line of data.logs) {
                     logHtml += `<div>${line}</div>`;
@@ -392,6 +515,24 @@ HTML_TEMPLATE = """
             fetchStatus();
         }
 
+        async function submitJobModal() {
+            const payload = {
+                job_name: document.getElementById('input-job-name').value,
+                dataset_location: document.getElementById('input-dataset').value,
+                num_workers: parseInt(document.getElementById('input-workers').value),
+                training_code: document.getElementById('input-parallel').value,
+                resource_requirements: { gpu: parseInt(document.getElementById('input-gpu').value) }
+            };
+            await fetch('/api/jobs/submit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const modalEl = document.getElementById('jobModal');
+            bootstrap.Modal.getInstance(modalEl).hide();
+            fetchStatus();
+        }
+
         // Auto poll every 1.5 seconds
         setInterval(fetchStatus, 1500);
         fetchStatus();
@@ -408,19 +549,31 @@ def index():
 
 @app.route("/api/cluster", methods=["GET"])
 def get_cluster():
-    return jsonify(harness.get_cluster_status())
+    return jsonify(get_harness().get_cluster_status())
 
 
 @app.route("/api/train_step", methods=["POST"])
 def run_step():
-    res = harness.train_step()
+    res = get_harness().train_step()
     return jsonify(res)
 
 
 @app.route("/api/simulate_crash", methods=["POST"])
 def simulate_crash():
-    res = harness.simulate_crash()
+    res = get_harness().simulate_crash()
     return jsonify(res)
+
+
+@app.route("/api/jobs/submit", methods=["POST"])
+def submit_job():
+    data = request.get_json() or {}
+    job = get_harness().submit_job(data)
+    return jsonify(job), 201
+
+
+@app.route("/api/jobs", methods=["GET"])
+def list_jobs():
+    return jsonify(get_harness().jobs), 200
 
 
 if __name__ == "__main__":
