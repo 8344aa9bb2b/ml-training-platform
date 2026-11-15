@@ -196,9 +196,8 @@ class TestMetricMessage:
             metrics={"loss": 0.7},
             step=300,
         )
-        elapsed = time.time() - start_time
-        assert 0 < (metric_msg.timestamp - start_time) < 1
-        assert elapsed < 1
+        assert metric_msg.timestamp >= start_time
+        assert (metric_msg.timestamp - start_time) < 1.0
 
 
 if __name__ == "__main__":

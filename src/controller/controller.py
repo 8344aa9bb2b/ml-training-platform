@@ -8,6 +8,7 @@ from collections import defaultdict
 
 from src.network.message_types import Message, MessageTypes, TaskMessage
 from src.network.socket_manager import SocketManager
+from src.scheduler.task_scheduler import TaskScheduler, Task
 from core.config_loader import load_yaml_config
 from core.logger import get_logger
 from core.resource_monitor import ResourceMonitor
@@ -38,6 +39,14 @@ class Controller:
         self.task_queue: List[TaskMessage] = []
         self.job_status: Dict[str, dict] = {}
         self.health_check_interval = self.controller_config.get("heartbeat_interval", 10.0)
+
+        # Initialize task scheduler
+        self.scheduler = TaskScheduler(
+            max_concurrent_tasks=self.controller_config.get("max_workers", 100),
+            scheduling_policy=self.controller_config.get("scheduling_policy", "round_robin"),
+            placement_policy=self.controller_config.get("placement_policy", "least_loaded"),
+            logger=self.logger
+        )
 
         # Component initialization
         self._init_components()
@@ -183,6 +192,7 @@ class Controller:
             self.logger.info(f"Worker {worker_id} already registered")
         else:
             self.worker_registry[worker_id] = worker_info
+            self.scheduler.register_worker(worker_id, worker_info)
             self.logger.info(f"Registered new worker: {worker_id}")
 
         # Registration counts as proof of life
@@ -206,6 +216,7 @@ class Controller:
 
         for dead in dead_workers:
             del self.worker_registry[dead]
+            self.scheduler.unregister_worker(dead)
             self.logger.warning(f"Removed dead worker: {dead}")
 
         return dead_workers
@@ -242,10 +253,11 @@ class Controller:
 
         while self.running:
             try:
-                if self.task_queue and self.worker_registry:
-                    # TODO: Implement actual scheduling logic
-                    # For now, just log startup
-                    pass
+                if self.task_queue:
+                    # Move tasks from queue to scheduler
+                    for task_msg in self.task_queue:
+                        self.scheduler.schedule_batch([task_msg])
+                    self.task_queue = []
                 time.sleep(0.5)
             except Exception as e:
                 self.logger.error(f"Error in workload scheduler: {e}")
