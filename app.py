@@ -1,7 +1,7 @@
 """Hugging Face Spaces Entrypoint (100% Free Gradio / Native SDK).
 
 Compatible with:
-- Hugging Face Spaces (sdk: gradio, 16GB free RAM)
+- Hugging Face Spaces (sdk: gradio, ZeroGPU / CPU, 16GB free RAM)
 - Local Python execution (python app.py)
 """
 
@@ -52,7 +52,16 @@ def create_gradio_app():
 
         workers_data = []
         for w in status.get("workers", []):
-            workers_data.append([w["id"], w["status"].upper(), f"{w['loss']:.4f}", f"{w['last_seen']}s ago", w["gpu"]])
+            cpu_pct = f"{w.get('cpu_percent', 0.0)}%"
+            last_seen = f"{w.get('last_seen', 0.0)}s ago"
+            workers_data.append([
+                str(w.get("id", "worker")),
+                str(w.get("status", "active")).upper(),
+                f"{loss:.4f}",
+                cpu_pct,
+                last_seen,
+                str(w.get("gpu", "N/A")),
+            ])
 
         return (
             f"Active: {active_w}/2",
@@ -79,7 +88,7 @@ def create_gradio_app():
         })
         return refresh_stats()
 
-    with gr.Blocks(title="RMLTP Distributed ML Platform", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="RMLTP Distributed ML Platform", theme=gr.themes.Soft()) as demo_app:
         gr.Markdown(
             """
             # ⚡ RMLTP — Distributed Machine Learning Platform
@@ -103,8 +112,8 @@ def create_gradio_app():
             with gr.Column(scale=3):
                 gr.Markdown("### 🖥️ Cluster Worker Nodes")
                 workers_table = gr.Dataframe(
-                    headers=["Node ID", "Status", "Loss", "Last Seen", "Hardware"],
-                    datatype=["str", "str", "str", "str", "str"],
+                    headers=["Node ID", "Status", "Loss", "CPU Usage", "Last Seen", "Hardware"],
+                    datatype=["str", "str", "str", "str", "str", "str"],
                     interactive=False,
                 )
 
@@ -130,24 +139,25 @@ def create_gradio_app():
         btn_submit.click(on_submit_job, inputs=[in_job_name, in_dataset, in_workers], outputs=[stat_workers, stat_step, stat_loss, stat_throughput, workers_table, log_box])
 
         # Initial load
-        demo.load(refresh_stats, outputs=[stat_workers, stat_step, stat_loss, stat_throughput, workers_table, log_box])
+        demo_app.load(refresh_stats, outputs=[stat_workers, stat_step, stat_loss, stat_throughput, workers_table, log_box])
 
-    return demo
+    return demo_app
 
 
-def main():
-    port = int(os.environ.get("PORT", 7860))
-
-    try:
-        demo = create_gradio_app()
-        print(f"\n🚀 Launching RMLTP Gradio Dashboard on 0.0.0.0:{port}...\n")
-        demo.launch(server_name="0.0.0.0", server_port=port, share=False)
-    except ImportError:
-        # Fallback to Flask if gradio is not installed in local environment
-        from dashboard import app
-        print(f"\n🚀 Gradio not found. Launching RMLTP Flask Dashboard on 0.0.0.0:{port}...\n")
-        app.run(host="0.0.0.0", port=port, debug=False)
+# Top-level demo object for Gradio hot-reload and Hugging Face Spaces runner
+try:
+    import gradio as gr
+    demo = create_gradio_app()
+except ImportError:
+    demo = None
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 7860))
+    if demo is not None:
+        print(f"\n🚀 Launching RMLTP Gradio Dashboard on 0.0.0.0:{port}...\n")
+        demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+    else:
+        from dashboard import app
+        print(f"\n🚀 Gradio not found. Launching RMLTP Flask Dashboard on 0.0.0.0:{port}...\n")
+        app.run(host="0.0.0.0", port=port, debug=False)
