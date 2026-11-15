@@ -1,3 +1,16 @@
+---
+title: Ml Training Platform
+emoji: 🏆
+colorFrom: pink
+colorTo: blue
+sdk: gradio
+sdk_version: 6.32.0
+python_version: '3.12'
+app_file: app.py
+pinned: false
+short_description: Distributed Machine Learning Platform
+---
+
 # RMLTP — Distributed Machine Learning Platform
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)

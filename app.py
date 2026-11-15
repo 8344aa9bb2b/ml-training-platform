@@ -1,85 +1,135 @@
-"""Hugging Face Spaces Entrypoint (100% Free Tier - No Credit Card Required).
+"""Hugging Face Spaces Entrypoint (100% Free Gradio / Native SDK).
 
-Launches:
-1. Controller Orchestrator Daemon on tcp://127.0.0.1:8000
-2. Worker 1 Daemon on tcp://127.0.0.1:8001
-3. Worker 2 Daemon on tcp://127.0.0.1:8002
-4. Serves the interactive Web Dashboard on port 7860 (Hugging Face default)
+Compatible with:
+- Hugging Face Spaces (sdk: gradio, 16GB free RAM)
+- Local Python execution (python app.py)
 """
 
 import os
 import sys
 import time
-import threading
+import uuid
 from pathlib import Path
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.controller.controller import Controller
-from src.node.worker import Worker
-from core.logger import get_logger
-from dashboard import app
+from dashboard import get_harness
 
 
-def start_background_cluster():
-    """Start Controller and Workers in daemon background threads over real ZeroMQ TCP."""
-    logger = get_logger("hf_spaces_supervisor")
-    logger.info("Initializing multi-node distributed cluster...")
+def create_gradio_app():
+    """Build a Gradio Blocks application wired directly into RMLTP cluster harness."""
+    import gradio as gr
 
-    # 1. Start Controller
-    ctrl_cfg = {
-        "controller": {
-            "host": "127.0.0.1",
-            "port": 8000,
-            "heartbeat_interval": 2.0,
-            "max_task_retries": 3,
-        },
-        "monitoring": {
-            "prometheus_enabled": False,
-            "checkpoint_dir": "./logs/checkpoints",
-        },
-        "logging": {"level": "INFO"},
-    }
-    controller = Controller(config=ctrl_cfg, logger=logger)
-    ctrl_thread = threading.Thread(target=controller.serve, daemon=True)
-    ctrl_thread.start()
-    time.sleep(1.0)
+    harness = get_harness()
 
-    # 2. Start Worker 1
-    w1_cfg = {
-        "nodes": {
-            "id": "worker-hf-1",
-            "host": "127.0.0.1",
-            "port": 8001,
-            "health_check": {"interval": 2.0},
-        }
-    }
-    worker1 = Worker(config=w1_cfg, logger=logger)
-    worker1.connect_to_controller("tcp://127.0.0.1:8000")
-    w1_thread = threading.Thread(target=worker1.serve, daemon=True)
-    w1_thread.start()
+    def refresh_stats():
+        status = harness.get_cluster_status()
+        active_w = len(status.get("workers", []))
+        step = status.get("step", 0)
+        loss = status.get("loss", 0.0)
+        throughput = status.get("throughput", 0.0)
+        logs_str = "\n".join(status.get("logs", []))
 
-    # 3. Start Worker 2
-    w2_cfg = {
-        "nodes": {
-            "id": "worker-hf-2",
-            "host": "127.0.0.1",
-            "port": 8002,
-            "health_check": {"interval": 2.0},
-        }
-    }
-    worker2 = Worker(config=w2_cfg, logger=logger)
-    worker2.connect_to_controller("tcp://127.0.0.1:8000")
-    w2_thread = threading.Thread(target=worker2.serve, daemon=True)
-    w2_thread.start()
+        workers_data = []
+        for w in status.get("workers", []):
+            workers_data.append([w["id"], w["status"].upper(), f"{w['loss']:.4f}", f"{w['last_seen']}s ago", w["gpu"]])
 
-    logger.info("Cluster supervisor: Controller + 2 Workers active over ZeroMQ TCP.")
+        return (
+            f"Active: {active_w}/2",
+            str(step),
+            f"{loss:.4f}",
+            f"{throughput:.1f} samples/s",
+            workers_data,
+            logs_str,
+        )
+
+    def on_train_step():
+        harness.train_step()
+        return refresh_stats()
+
+    def on_simulate_crash():
+        harness.simulate_crash()
+        return refresh_stats()
+
+    def on_submit_job(name, dataset, num_workers):
+        harness.submit_job({
+            "job_name": name,
+            "dataset_location": dataset,
+            "num_workers": int(num_workers),
+        })
+        return refresh_stats()
+
+    with gr.Blocks(title="RMLTP Distributed ML Platform", theme=gr.themes.Soft()) as demo:
+        gr.Markdown(
+            """
+            # ⚡ RMLTP — Distributed Machine Learning Platform
+            **Kubernetes-style Orchestration + Ray Dynamic Scheduling + PyTorch Distributed Core**
+            *Running live in free Hugging Face Space (ZeroMQ TCP transport + ModelRunner)*
+            """
+        )
+
+        with gr.Row():
+            stat_workers = gr.Textbox(label="Cluster Nodes", interactive=False)
+            stat_step = gr.Textbox(label="Global Step", interactive=False)
+            stat_loss = gr.Textbox(label="Training Loss", interactive=False)
+            stat_throughput = gr.Textbox(label="Throughput", interactive=False)
+
+        with gr.Row():
+            btn_step = gr.Button("🚀 Trigger Distributed Training Step", variant="primary")
+            btn_crash = gr.Button("💥 Simulate Worker Crash / Failover", variant="stop")
+            btn_refresh = gr.Button("🔄 Refresh Telemetry", variant="secondary")
+
+        with gr.Row():
+            with gr.Column(scale=3):
+                gr.Markdown("### 🖥️ Cluster Worker Nodes")
+                workers_table = gr.Dataframe(
+                    headers=["Node ID", "Status", "Loss", "Last Seen", "Hardware"],
+                    datatype=["str", "str", "str", "str", "str"],
+                    interactive=False,
+                )
+
+            with gr.Column(scale=2):
+                gr.Markdown("### 📜 Real-Time Cluster Event Stream")
+                log_box = gr.TextArea(
+                    label="Logs",
+                    lines=10,
+                    interactive=False,
+                )
+
+        with gr.Accordion("➕ Submit New Distributed Training Job", open=False):
+            with gr.Row():
+                in_job_name = gr.Textbox(label="Job Name", value="cifar10-resnet50")
+                in_dataset = gr.Textbox(label="Dataset Location", value="s3://ml-datasets/cifar10")
+                in_workers = gr.Slider(label="Worker Count", minimum=1, maximum=4, value=2, step=1)
+            btn_submit = gr.Button("Submit Job", variant="primary")
+
+        # Wire callbacks
+        btn_step.click(on_train_step, outputs=[stat_workers, stat_step, stat_loss, stat_throughput, workers_table, log_box])
+        btn_crash.click(on_simulate_crash, outputs=[stat_workers, stat_step, stat_loss, stat_throughput, workers_table, log_box])
+        btn_refresh.click(refresh_stats, outputs=[stat_workers, stat_step, stat_loss, stat_throughput, workers_table, log_box])
+        btn_submit.click(on_submit_job, inputs=[in_job_name, in_dataset, in_workers], outputs=[stat_workers, stat_step, stat_loss, stat_throughput, workers_table, log_box])
+
+        # Initial load
+        demo.load(refresh_stats, outputs=[stat_workers, stat_step, stat_loss, stat_throughput, workers_table, log_box])
+
+    return demo
+
+
+def main():
+    port = int(os.environ.get("PORT", 7860))
+
+    try:
+        demo = create_gradio_app()
+        print(f"\n🚀 Launching RMLTP Gradio Dashboard on 0.0.0.0:{port}...\n")
+        demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+    except ImportError:
+        # Fallback to Flask if gradio is not installed in local environment
+        from dashboard import app
+        print(f"\n🚀 Gradio not found. Launching RMLTP Flask Dashboard on 0.0.0.0:{port}...\n")
+        app.run(host="0.0.0.0", port=port, debug=False)
 
 
 if __name__ == "__main__":
-    start_background_cluster()
-    port = int(os.environ.get("PORT", 7860))
-    print(f"\n🚀 RMLTP Live Dashboard serving on http://0.0.0.0:{port}...\n")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    main()
