@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import os
 import time
 import yaml
 from pathlib import Path
@@ -19,6 +20,10 @@ def parse_args():
 
     parser.add_argument("--config", type=str, default="config/controller.yaml",
                         help="Path to controller configuration file")
+    parser.add_argument("--host", type=str, default=None,
+                        help="Host to bind controller on")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Port to bind controller on")
     parser.add_argument("--mode", type=str, choices=["serve", "job"],
                         default="serve", help="Operation mode: serve scheduler or run single job")
     parser.add_argument("--job-config", type=str, default=None,
@@ -28,10 +33,23 @@ def parse_args():
 
 
 def load_config(config_path: str) -> dict:
-    """Load configuration from YAML file."""
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    return config
+    """Load configuration from YAML file or provide fallback defaults."""
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            return yaml.safe_load(f) or {}
+    return {
+        "controller": {
+            "host": "127.0.0.1",
+            "port": 8000,
+            "heartbeat_interval": 2.0,
+            "max_task_retries": 3,
+        },
+        "monitoring": {
+            "prometheus_enabled": False,
+            "checkpoint_dir": "./logs/checkpoints",
+        },
+        "logging": {"level": "INFO"},
+    }
 
 
 def main():
@@ -39,17 +57,18 @@ def main():
     args = parse_args()
 
     # Load configuration
-    try:
-        config = load_config(args.config)
-    except FileNotFoundError:
-        print(f"Error: Configuration file not found: {args.config}")
-        sys.exit(1)
+    config = load_config(args.config)
+    ctrl_cfg = config.setdefault("controller", {})
+
+    if args.host:
+        ctrl_cfg["host"] = args.host
+    if args.port:
+        ctrl_cfg["port"] = args.port
 
     # Setup logging
     logger = get_logger(name="controller", config=config.get("logging", {}))
 
-    logger.info(f"Starting controller in {args.mode} mode")
-    logger.info(f"Configuration file: {args.config}")
+    logger.info(f"Starting controller in {args.mode} mode on {ctrl_cfg.get('host', '127.0.0.1')}:{ctrl_cfg.get('port', 8000)}")
 
     # Create and start controller
     controller = Controller(config=config, logger=logger)
@@ -64,6 +83,8 @@ def main():
         except Exception as e:
             logger.error(f"Controller error: {e}")
             sys.exit(1)
+        finally:
+            controller.stop()
 
     elif args.mode == "job":
         if not args.job_config:
@@ -77,6 +98,8 @@ def main():
         except Exception as e:
             logger.error(f"Job execution failed: {e}")
             sys.exit(1)
+        finally:
+            controller.stop()
 
 
 if __name__ == "__main__":
