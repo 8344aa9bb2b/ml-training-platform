@@ -1,0 +1,40 @@
+nodes:
+  id: worker-1  # Worker node identifier
+  controller_address: localhost:8000
+  scheduler_address: localhost:8001
+  logging:
+    level: INFO
+    directory: ./logs
+  monitoring:
+    enabled: true
+    prometheus_port: 8001
+  resources:
+    gpu:
+      available: 1
+      model: "nvidia-rtx-3080"
+      memory: 10GiB
+    cpu:
+      available: 8
+      threads_per_core: 2
+      memory: 16GiB
+  health_check:
+    interval: 5.0
+    timeout: 10.0
+
+# Example configuration for multiple nodes (used by launch script)
+# nodes:
+#   - id: worker-1
+#     controller_address: controller:8000
+#     gpu:
+#       available: 1
+#       device_id: 0
+#   - id: worker-2
+#     controller_address: controller:8000
+#     gpu:
+#       available: 1
+#       device_id: 0
+#   - id: worker-3
+#     controller_address: controller:8000
+#     gpu:
+#       available: 2
+#       device_id: [0, 1]
