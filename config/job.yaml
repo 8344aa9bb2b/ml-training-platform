@@ -1,0 +1,41 @@
+job:
+  name: example-sgd-job
+  description: Example training job with synchronous SGD
+  type: training
+  model:
+    name: resnet-50
+    config:
+      num_layers: 50
+      input_size: [3, 224, 224]
+    training_options:
+      batch_size: 32
+      learning_rate: 0.01
+      momentum: 0.9
+      weight_decay: 0.0001
+  parallelism:
+    mode: synchronous  # or: asynchronous
+    pipeline_partitions: 1
+    gradient_averaging: true
+  hardware:
+    min_nodes: 2
+    max_nodes: 8
+    gpu_per_node: 1
+    cpu_per_node: 8
+    memory_per_node: 16GiB
+  checkpoint:
+    enabled: true
+    save_frequency: 100
+    save_directory: "./logs/checkpoints"
+    checkpoint_format: "pytorch"
+  logging:
+    level: INFO
+    metrics_frequency: 10
+    tensorboard: true
+    output_directory: "./logs/experiments/example-sgd-job"
+  training:
+    num_epochs: 10
+    num_steps_per_epoch: 1000
+    early_stopping:
+      enabled: false
+      patience: 5
+      baseline_metric: validation_loss

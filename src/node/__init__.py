@@ -1,0 +1,1 @@
+"""Node module - worker agents for distributed training."""
